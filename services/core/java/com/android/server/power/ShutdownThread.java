@@ -18,10 +18,10 @@
 package com.android.server.power;
 
 import android.app.ActivityManagerNative;
-import android.app.AlarmManager;
 import android.app.AlertDialog;
 import android.app.Dialog;
 import android.app.IActivityManager;
+import android.app.KeyguardManager;
 import android.app.ProgressDialog;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.IBluetoothManager;
@@ -49,6 +49,7 @@ import android.os.storage.IMountService;
 import android.os.storage.IMountShutdownObserver;
 import android.system.ErrnoException;
 import android.system.Os;
+import android.widget.ListView;
 
 import com.android.internal.telephony.ITelephony;
 import com.android.server.pm.PackageManagerService;
@@ -61,17 +62,13 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 
-import java.lang.reflect.Method;
-
 public final class ShutdownThread extends Thread {
     // constants
     private static final String TAG = "ShutdownThread";
     private static final int PHONE_STATE_POLL_SLEEP_MSEC = 500;
     // maximum time we wait for the shutdown broadcast before going on.
     private static final int MAX_BROADCAST_TIME = 10*1000;
-    // maximun time we wait for the mountservice before going on.
-    // Short time may cause unmount fail if 3rd app occupy files, but no impact on app use.
-    private static final int MAX_SHUTDOWN_WAIT_TIME = SystemProperties.getInt("sys.shutdown.waittime",20*1000);
+    private static final int MAX_SHUTDOWN_WAIT_TIME = 20*1000;
     private static final int MAX_RADIO_WAIT_TIME = 12*1000;
     private static final int MAX_UNCRYPT_WAIT_TIME = 15*60*1000;
     // constants for progress bar. the values are roughly estimated based on timeout.
@@ -80,6 +77,7 @@ public final class ShutdownThread extends Thread {
     private static final int PACKAGE_MANAGER_STOP_PERCENT = 6;
     private static final int RADIO_STOP_PERCENT = 18;
     private static final int MOUNT_SERVICE_STOP_PERCENT = 20;
+    private static final String SOFT_REBOOT = "soft_reboot";
 
     // length of vibration before shutting down
     private static final int SHUTDOWN_VIBRATE_MS = 500;
@@ -141,6 +139,14 @@ public final class ShutdownThread extends Thread {
         shutdownInner(context, confirm);
     }
 
+    private static boolean isAdvancedRebootPossible(final Context context) {
+        boolean advancedRebootEnabled = context.getResources().getBoolean(
+            com.android.internal.R.bool.config_advanced_reboot);
+        boolean isPrimaryUser = UserHandle.getCallingUserId() == UserHandle.USER_SYSTEM;
+
+        return advancedRebootEnabled && !mRebootSafeMode && isPrimaryUser;
+    }
+
     static void shutdownInner(final Context context, boolean confirm) {
         // ensure that only one thread is trying to power down.
         // any additional calls are just returned
@@ -175,29 +181,74 @@ public final class ShutdownThread extends Thread {
 
         if (confirm) {
             final CloseDialogReceiver closer = new CloseDialogReceiver(context);
+            final boolean advancedReboot = isAdvancedRebootPossible(context);
+
             if (sConfirmDialog != null) {
                 sConfirmDialog.dismiss();
+                sConfirmDialog = null;
             }
-            sConfirmDialog = new AlertDialog.Builder(context)
+            AlertDialog.Builder confirmDialogBuilder = new AlertDialog.Builder(context)
                     .setTitle(mRebootSafeMode
                             ? com.android.internal.R.string.reboot_safemode_title
                             : showRebootOption
-                                    ? com.android.internal.R.string.reboot_title
-                                    : com.android.internal.R.string.power_off)
-                    .setMessage(resourceId)
-                    .setPositiveButton(com.android.internal.R.string.yes, new DialogInterface.OnClickListener() {
+                                    ? com.android.internal.R.string.global_action_reboot
+                                    : com.android.internal.R.string.power_off);
+
+            if (!advancedReboot) {
+                confirmDialogBuilder.setMessage(resourceId);
+            } else {
+                confirmDialogBuilder
+                      .setSingleChoiceItems(com.android.internal.R.array.shutdown_reboot_options,
+                              0, null);
+            }
+
+            confirmDialogBuilder.setPositiveButton(com.android.internal.R.string.yes,
+                    new DialogInterface.OnClickListener() {
+                        @Override
                         public void onClick(DialogInterface dialog, int which) {
+                            if (advancedReboot) {
+                                boolean softReboot = false;
+                                ListView reasonsList = ((AlertDialog)dialog).getListView();
+                                int selected = reasonsList.getCheckedItemPosition();
+                                if (selected != ListView.INVALID_POSITION) {
+                                    String actions[] = context.getResources().getStringArray(
+                                            com.android.internal.R.array.shutdown_reboot_actions);
+                                    if (selected >= 0 && selected < actions.length) {
+                                        mRebootReason = actions[selected];
+                                        if (actions[selected].equals(SOFT_REBOOT)) {
+                                            doSoftReboot();
+                                            return;
+                                        }
+                                    }
+                                }
+
+                                mReboot = true;
+                            }
                             beginShutdownSequence(context);
-                        }
-                    })
-                    .setNegativeButton(com.android.internal.R.string.no, null)
-                    .create();
+                      }
+                  });
+
+            confirmDialogBuilder.setNegativeButton(com.android.internal.R.string.no, null);
+            sConfirmDialog = confirmDialogBuilder.create();
+
             closer.dialog = sConfirmDialog;
             sConfirmDialog.setOnDismissListener(closer);
             sConfirmDialog.getWindow().setType(WindowManager.LayoutParams.TYPE_KEYGUARD_DIALOG);
             sConfirmDialog.show();
         } else {
             beginShutdownSequence(context);
+        }
+    }
+
+    private static void doSoftReboot() {
+        try {
+            final IActivityManager am =
+                  ActivityManagerNative.asInterface(ServiceManager.checkService("activity"));
+            if (am != null) {
+                am.restart();
+            }
+        } catch (RemoteException e) {
+            Log.e(TAG, "failure trying to perform soft reboot", e);
         }
     }
 
@@ -313,9 +364,12 @@ public final class ShutdownThread extends Thread {
             }
         } else if (PowerManager.REBOOT_RECOVERY.equals(mReason)) {
             // Factory reset path. Set the dialog message accordingly.
-            pd.setTitle(context.getText(com.android.internal.R.string.reboot_to_reset_title));
+            pd.setTitle(context.getText(com.android.internal.R.string.global_action_reboot));
             pd.setMessage(context.getText(
-                        com.android.internal.R.string.reboot_to_reset_message));
+                        com.android.internal.R.string.reboot_progress));
+        } else if (mReboot) {
+            pd.setTitle(context.getText(com.android.internal.R.string.global_action_reboot));
+            pd.setMessage(context.getText(com.android.internal.R.string.reboot_progress));
             pd.setIndeterminate(true);
         } else {
             pd.setTitle(context.getText(com.android.internal.R.string.power_off));
@@ -513,26 +567,6 @@ public final class ShutdownThread extends Thread {
             uncrypt();
         }
 
-
-        // If it is alarm boot and encryption status, power off alarm status will
-        // be set to handled when device go to shutdown or reboot.
-        boolean isAlarmBoot = SystemProperties.getBoolean("ro.alarm_boot", false);
-        String cryptState = SystemProperties.get("vold.decrypt");
-
-        if (isAlarmBoot &&
-                ("trigger_restart_min_framework".equals(cryptState) ||
-                "1".equals(cryptState))) {
-            AlarmManager.writePowerOffAlarmFile(AlarmManager.POWER_OFF_ALARM_HANDLE_FILE,
-                    AlarmManager.POWER_OFF_ALARM_HANDLED);
-        }
-
-        // If it is factory data reset, value in POWER_OFF_ALARM_TIMEZONE_FILE will be cleared.
-        if (mReboot && PowerManager.REBOOT_RECOVERY.equals(mReason)) {
-            AlarmManager.writePowerOffAlarmFile(AlarmManager.POWER_OFF_ALARM_TIMEZONE_FILE, "");
-        } else {
-            AlarmManager.writePowerOffAlarmFile(AlarmManager.POWER_OFF_ALARM_TIMEZONE_FILE,
-                    SystemProperties.get("persist.sys.timezone"));
-        }
         rebootOrShutdown(mContext, mReboot, mReason);
     }
 
@@ -672,33 +706,6 @@ public final class ShutdownThread extends Thread {
     }
 
     /**
-     * OEM shutdown handler. This function will load the oem-services jar file
-     * and call into the rebootOrShutdown method defined there if present
-     */
-    private static void deviceRebootOrShutdown(boolean reboot, String reason)
-    {
-            Class<?> cl;
-            String deviceShutdownClassName = "com.qti.server.power.ShutdownOem";
-            String deviceShutdownMethodName = "rebootOrShutdown";
-            try {
-                    cl = Class.forName(deviceShutdownClassName);
-                    Method m;
-                    try {
-                        m = cl.getMethod(deviceShutdownMethodName, new Class[] {boolean.class, String.class});
-                        m.invoke(cl.newInstance(), reboot, reason);
-                    } catch (NoSuchMethodException ex) {
-                        Log.e(TAG, "Unable to find method " + deviceShutdownMethodName + " in class " + deviceShutdownClassName);
-                    } catch (Exception ex) {
-                        Log.e(TAG, "Unknown exception while trying to invoke " + deviceShutdownMethodName);
-                    }
-            } catch (ClassNotFoundException e) {
-                Log.e(TAG, "Unable to find class " + deviceShutdownClassName);
-            } catch (Exception e) {
-                Log.e(TAG, "Unknown exception while loading class " + deviceShutdownClassName);
-            }
-    }
-
-    /**
      * Do not call this directly. Use {@link #reboot(Context, String, boolean)}
      * or {@link #shutdown(Context, boolean)} instead.
      *
@@ -707,8 +714,6 @@ public final class ShutdownThread extends Thread {
      * @param reason reason for reboot/shutdown
      */
     public static void rebootOrShutdown(final Context context, boolean reboot, String reason) {
-        // Call oem shutdown handler
-        deviceRebootOrShutdown(reboot, reason);
         if (reboot) {
             Log.i(TAG, "Rebooting, reason: " + reason);
             PowerManagerService.lowLevelReboot(reason);
