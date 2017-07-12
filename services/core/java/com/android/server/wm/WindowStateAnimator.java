@@ -586,6 +586,7 @@ class WindowStateAnimator {
             //dump();
             mLastHidden = true;
             if (mSurfaceController != null) {
+                mService.updateNonSystemOverlayWindowsVisibilityIfNeeded(mWin, false);
                 mSurfaceController.hideInTransaction(reason);
             }
         }
@@ -1813,6 +1814,7 @@ class WindowStateAnimator {
         if (!shown)
             return false;
 
+        mService.updateNonSystemOverlayWindowsVisibilityIfNeeded(mWin, true);
         if (mWin.mTurnOnScreen) {
             if (DEBUG_VISIBILITY) Slog.v(TAG, "Show surface turning screen on: " + mWin);
             mWin.mTurnOnScreen = false;
