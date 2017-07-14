@@ -209,7 +209,7 @@ public:
      */
     FileType getFileType(const char* fileName);
 
-    /*                                                                       
+    /*
      * Return the complete resource table to find things in the package.
      */
     const ResTable& getResources(bool required = true) const;

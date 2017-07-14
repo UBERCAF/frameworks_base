@@ -205,5 +205,4 @@ public abstract class PackageManagerInternal {
      *                     which to load the paths, or null if no overlays should be used.
      */
     public abstract void setResourceDirs(int userId, String packageName, String[] resourceDirs);
->>>>>>> 1901186a091... OMS7-N: Introduce the OverlayManagerService [2/11]
 }
